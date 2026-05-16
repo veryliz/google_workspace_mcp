@@ -146,57 +146,31 @@ async def search_docs(
     ]
 )
 async def get_doc_content(
-    drive_service: Any,
-    docs_service: Any,
-    user_google_email: str,
-    document_id: str,
-    suggestions_view_mode: str = "DEFAULT_FOR_CURRENT_ACCESS",
+        drive_service: Any,
+        docs_service: Any,
+        user_google_email: str,
+        document_id: str,
+        suggestions_view_mode: str = "DEFAULT_FOR_CURRENT_ACCESS",
 ) -> str:
     """
     Retrieves content of a Google Doc or a Drive file (like .docx) identified by document_id.
-    - Native Google Docs: Fetches content via Docs API.
+    - Native Google Docs: Fetches content via Docs API (Bypasses Drive API to support minimum scopes).
     - Office files (.docx, etc.) stored in Drive: Downloads via Drive API and extracts text.
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the Google Doc (or full URL)
-        suggestions_view_mode: How to render suggestions in the returned content:
-            - "DEFAULT_FOR_CURRENT_ACCESS": Default based on user's access level
-            - "SUGGESTIONS_INLINE": Suggested changes appear inline in the document
-            - "PREVIEW_SUGGESTIONS_ACCEPTED": Preview as if all suggestions were accepted
-            - "PREVIEW_WITHOUT_SUGGESTIONS": Preview as if all suggestions were rejected
-
-    Returns:
-        str: The document content with metadata header.
     """
     validation_error = validate_suggestions_view_mode(suggestions_view_mode)
     if validation_error:
         return validation_error
-    logger.info(
-        f"[get_doc_content] Invoked. Document/File ID: '{document_id}' for user '{user_google_email}'"
-    )
 
-    file_metadata = await asyncio.to_thread(
-        drive_service.files()
-        .get(
-            fileId=document_id,
-            fields="id, name, mimeType, webViewLink",
-            supportsAllDrives=True,
-        )
-        .execute
-    )
-    mime_type = file_metadata.get("mimeType", "")
-    file_name = file_metadata.get("name", "Unknown File")
-    web_view_link = file_metadata.get("webViewLink", "#")
-
-    logger.info(
-        f"[get_doc_content] File '{file_name}' (ID: {document_id}) has mimeType: '{mime_type}'"
-    )
+    logger.info(f"[get_doc_content] Invoked. Document/File ID: '{document_id}' for user '{user_google_email}'")
 
     body_text = ""
+    file_name = "Unknown File"
+    mime_type = ""
+    web_view_link = f"https://docs.google.com/document/d/{document_id}/edit" # Default Docs link
 
-    if mime_type == "application/vnd.google-apps.document":
-        logger.info("[get_doc_content] Processing as native Google Doc.")
+    # --- ATTEMPT 1: NATIVE GOOGLE DOC (Uses Docs API Only) ---
+    try:
+        logger.info("[get_doc_content] Attempting to fetch as native Google Doc using Docs API...")
         doc_data = await asyncio.to_thread(
             docs_service.documents()
             .get(
@@ -206,6 +180,11 @@ async def get_doc_content(
             )
             .execute
         )
+
+        # If successful, it's a native doc. Extract metadata from the Docs API response.
+        mime_type = "application/vnd.google-apps.document"
+        file_name = doc_data.get("title", "Unknown Document")
+
         TAB_HEADER_FORMAT = "\n--- TAB: {tab_name} (ID: {tab_id}) ---\n"
 
         def extract_text_from_elements(elements, tab_name=None, tab_id=None, depth=0):
@@ -214,9 +193,7 @@ async def get_doc_content(
                 return ""
             text_lines = []
             if tab_name:
-                text_lines.append(
-                    TAB_HEADER_FORMAT.format(tab_name=tab_name, tab_id=tab_id)
-                )
+                text_lines.append(TAB_HEADER_FORMAT.format(tab_name=tab_name, tab_id=tab_id))
 
             for element in elements:
                 if "paragraph" in element:
@@ -230,16 +207,13 @@ async def get_doc_content(
                     if current_line_text.strip():
                         text_lines.append(current_line_text)
                 elif "table" in element:
-                    # Handle table content
                     table = element.get("table", {})
                     table_rows = table.get("tableRows", [])
                     for row in table_rows:
                         row_cells = row.get("tableCells", [])
                         for cell in row_cells:
                             cell_content = cell.get("content", [])
-                            cell_text = extract_text_from_elements(
-                                cell_content, depth=depth + 1
-                            )
+                            cell_text = extract_text_from_elements(cell_content, depth=depth + 1)
                             if cell_text.strip():
                                 text_lines.append(cell_text)
             return "".join(text_lines)
@@ -247,7 +221,6 @@ async def get_doc_content(
         def process_tab_hierarchy(tab, level=0):
             """Process a tab and its nested child tabs recursively"""
             tab_text = ""
-
             if "documentTab" in tab:
                 props = tab.get("tabProperties", {})
                 tab_title = props.get("title", "Untitled Tab")
@@ -260,13 +233,12 @@ async def get_doc_content(
             child_tabs = tab.get("childTabs", [])
             for child_tab in child_tabs:
                 tab_text += process_tab_hierarchy(child_tab, level + 1)
-
             return tab_text
 
         processed_text_lines = []
-
         body_elements = doc_data.get("body", {}).get("content", [])
         main_content = extract_text_from_elements(body_elements)
+
         if main_content.strip():
             processed_text_lines.append(main_content)
 
@@ -277,50 +249,62 @@ async def get_doc_content(
                 processed_text_lines.append(tab_content)
 
         body_text = "".join(processed_text_lines)
-    else:
-        logger.info(
-            f"[get_doc_content] Processing as Drive file (e.g., .docx, other). MimeType: {mime_type}"
-        )
 
-        export_mime_type_map = {
-            # Example: "application/vnd.google-apps.spreadsheet"z: "text/csv",
-            # Native GSuite types that are not Docs would go here if this function
-            # was intended to export them. For .docx, direct download is used.
-        }
-        effective_export_mime = export_mime_type_map.get(mime_type)
+    # --- ATTEMPT 2: NON-NATIVE FILE (Requires Drive API) ---
+    except Exception as e:
+        logger.info(f"[get_doc_content] Docs API failed, likely a Drive file or insufficient scopes. Attempting Drive API fallback... Error: {e}")
 
-        request_obj = (
-            drive_service.files().export_media(
-                fileId=document_id,
-                mimeType=effective_export_mime,
-                supportsAllDrives=True,
-            )
-            if effective_export_mime
-            else drive_service.files().get_media(
-                fileId=document_id, supportsAllDrives=True
-            )
-        )
-
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request_obj)
-        loop = asyncio.get_event_loop()
-        done = False
-        while not done:
-            status, done = await loop.run_in_executor(None, downloader.next_chunk)
-
-        file_content_bytes = fh.getvalue()
-
-        office_text = extract_office_xml_text(file_content_bytes, mime_type)
-        if office_text:
-            body_text = office_text
-        else:
-            try:
-                body_text = file_content_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                body_text = (
-                    f"[Binary or unsupported text encoding for mimeType '{mime_type}' - "
-                    f"{len(file_content_bytes)} bytes]"
+        try:
+            file_metadata = await asyncio.to_thread(
+                drive_service.files()
+                .get(
+                    fileId=document_id,
+                    fields="id, name, mimeType, webViewLink",
+                    supportsAllDrives=True,
                 )
+                .execute
+            )
+            mime_type = file_metadata.get("mimeType", "")
+            file_name = file_metadata.get("name", "Unknown File")
+            web_view_link = file_metadata.get("webViewLink", "#")
+
+            export_mime_type_map = {}
+            effective_export_mime = export_mime_type_map.get(mime_type)
+
+            request_obj = (
+                drive_service.files().export_media(
+                    fileId=document_id,
+                    mimeType=effective_export_mime,
+                    supportsAllDrives=True,
+                )
+                if effective_export_mime
+                else drive_service.files().get_media(
+                    fileId=document_id, supportsAllDrives=True
+                )
+            )
+
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request_obj)
+            loop = asyncio.get_event_loop()
+            done = False
+            while not done:
+                status, done = await loop.run_in_executor(None, downloader.next_chunk)
+
+            file_content_bytes = fh.getvalue()
+            office_text = extract_office_xml_text(file_content_bytes, mime_type)
+
+            if office_text:
+                body_text = office_text
+            else:
+                try:
+                    body_text = file_content_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    body_text = (
+                        f"[Binary or unsupported text encoding for mimeType '{mime_type}' - "
+                        f"{len(file_content_bytes)} bytes]"
+                    )
+        except Exception as drive_e:
+            return f"Error retrieving document. Docs API and Drive API both failed. Ensure you have the correct permissions. Details: {drive_e}"
 
     header = (
         f'File: "{file_name}" (ID: {document_id}, Type: {mime_type})\n'
